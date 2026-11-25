@@ -163,8 +163,8 @@ const shouldEndForSchedulingEmail = (call: CallResult) =>
   call.summary.recommendedNextAction.toLowerCase().includes('email available meeting time slots')
 
 const friendlyError = (message: string) => {
-  if (message.includes('OPENAI_API_KEY')) {
-    return 'LLM and Interactive Mode need a real OPENAI_API_KEY in .env. Use deterministic Scripted Mode for no-cost testing.'
+  if (message.includes('GROQ_API_KEY')) {
+    return 'LLM and Interactive Mode need a valid GROQ_API_KEY in .env. Restart the backend after configuring it.'
   }
 
   return message
@@ -213,8 +213,11 @@ function App() {
   const vapiRef = useRef<Vapi | null>(null)
   const pendingVoiceReplyRef = useRef('')
   const voiceSubmitTimerRef = useRef<number | null>(null)
+  const speakLatestAgentTurnRef = useRef<() => void>(() => {})
+  const startVapiVoiceRef = useRef<() => Promise<void>>(async () => {})
   const vapiSpokenAgentTurnRef = useRef(-1)
   const vapiCallStartedRef = useRef(false)
+  const vapiStartAttemptedRef = useRef(false)
   const pendingVapiAgentTurnRef = useRef<{
     endCallAfterSpoken: boolean
     index: number
@@ -380,7 +383,7 @@ function App() {
       return
     }
 
-    speakLatestAgentTurnWithVapi()
+    speakLatestAgentTurnRef.current()
   }, [activeCallMode, activeStartMode, call, callIsComplete, vapiVoiceActive])
 
   useEffect(() => {
@@ -413,12 +416,13 @@ function App() {
       !call ||
       (activeCallMode === 'interactive' && callIsComplete) ||
       !activeModeUsesVapiVoice ||
-      vapiVoiceStatus !== 'idle'
+      vapiVoiceStatus !== 'idle' ||
+      vapiStartAttemptedRef.current
     ) {
       return
     }
 
-    void startVapiVoice()
+    void startVapiVoiceRef.current()
   }, [activeCallMode, activeModeUsesVapiVoice, activeStartMode, call, callIsComplete, vapiVoiceStatus])
 
   const beginCall = async () => {
@@ -441,6 +445,9 @@ function App() {
     setLeadReply('')
     setVoiceError(null)
     setVapiVoiceError(null)
+    if ((startModeKey === 'ai_scripted' || startModeKey === 'ai_interactive') && !vapiVoiceConfigured) {
+      setVapiVoiceError('Vapi voice is not configured. Add VITE_VAPI_PUBLIC_KEY and VITE_VAPI_ASSISTANT_ID to .env, then restart the frontend.')
+    }
     setIsVoiceListening(false)
     pendingVoiceReplyRef.current = ''
     if (voiceSubmitTimerRef.current) {
@@ -453,6 +460,7 @@ function App() {
     }
     vapiSpokenAgentTurnRef.current = -1
     vapiCallStartedRef.current = false
+    vapiStartAttemptedRef.current = false
     pendingVapiAgentTurnRef.current = null
     recognitionRef.current?.abort()
     await stopVapiVoice()
@@ -504,6 +512,7 @@ function App() {
     setVapiVoiceError(null)
     pendingVoiceReplyRef.current = ''
     vapiCallStartedRef.current = false
+    vapiStartAttemptedRef.current = false
     pendingVapiAgentTurnRef.current = null
     if (voiceSubmitTimerRef.current) {
       window.clearTimeout(voiceSubmitTimerRef.current)
@@ -792,6 +801,8 @@ function App() {
       return
     }
 
+    if (vapiStartAttemptedRef.current) return
+    vapiStartAttemptedRef.current = true
     setVapiVoiceStatus('connecting')
     setVapiVoiceError(null)
 
@@ -883,6 +894,9 @@ function App() {
       )
     }
   }
+
+  speakLatestAgentTurnRef.current = speakLatestAgentTurnWithVapi
+  startVapiVoiceRef.current = startVapiVoice
 
   return (
     <main className="call-shell">
@@ -1075,6 +1089,9 @@ function App() {
         ) : null}
 
         {error ? <p className="error-message">{error}</p> : null}
+        {vapiVoiceError && activeCallMode !== 'interactive' ? (
+          <p className="voice-error">{vapiVoiceError}</p>
+        ) : null}
       </section>
 
       {isStartModalOpen ? (

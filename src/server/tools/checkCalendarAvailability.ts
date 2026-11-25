@@ -18,7 +18,10 @@ export const getCalendarSlots = async (): Promise<CalendarSlot[]> => {
   if (await fileExists(...runtimeCalendarPath)) {
     const runtimeSlots = await readJsonFile<CalendarSlot[]>(...runtimeCalendarPath);
 
-    if (runtimeSlots.some((slot) => slot.available)) {
+    const hasFutureSlot = runtimeSlots.some(
+      (slot) => slot.available && new Date(slot.startsAt).getTime() > Date.now(),
+    );
+    if (hasFutureSlot) {
       return runtimeSlots;
     }
   }
@@ -33,6 +36,7 @@ export const checkCalendarAvailability = async (
 
   return slots
     .filter((slot) => slot.available)
+    .filter((slot) => new Date(slot.startsAt).getTime() > Date.now())
     .filter((slot) =>
       preferredDate ? slot.startsAt.startsWith(preferredDate) : true,
     )

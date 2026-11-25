@@ -31,7 +31,7 @@ const requireVapiApiKey = () => {
 };
 
 const publicBaseUrl = () =>
-  (process.env.VAPI_PUBLIC_BASE_URL ?? "http://localhost:3001").replace(/\/$/, "");
+  (process.env.VAPI_PUBLIC_BASE_URL?.trim() || "http://localhost:3001").replace(/\/$/, "");
 
 const maxOutboundCalls = () => envNumber("VAPI_MAX_OUTBOUND_CALLS", 2, 10);
 

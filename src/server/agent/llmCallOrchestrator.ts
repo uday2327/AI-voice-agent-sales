@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { z } from "zod";
 import { carlaSystemPrompt } from "./carlaSystemPrompt.js";
 import { agentConfig } from "../config/agent.config.js";
 import { writeJsonFile } from "../storage/jsonStore.js";
@@ -49,31 +50,29 @@ type LeadScriptTurn = {
 
 type LeadContextForLlm = Omit<Lead, "scenario">;
 
-const leadIntentValues = [
-  "interested",
-  "objection",
-  "send_follow_up",
-  "call_back_later",
-  "not_interested",
-  "unqualified",
-] as const;
+const carlaTurnSchema = z.object({
+  reply: z.string().trim().min(1),
+  detectedPainPoints: z.array(z.string()),
+  detectedObjections: z.array(z.string()),
+  interestLevel: z.enum(["high", "medium", "low", "none"]),
+  recommendedToolCall: z.object({
+    name: z.enum(["getLeadContext", "checkCalendarAvailability", "bookMeeting", "saveCallSummary", "classifyLeadOutcome", "none"]),
+    reason: z.string(),
+  }),
+  outcome: z.enum(["meeting_booked", "interested", "send_follow_up", "call_back_later", "not_interested", "unqualified"]),
+  nextBestAction: z.string(),
+});
 
-const objectionTypeValues = [
-  "budget",
-  "timing",
-  "existing_tools",
-  "authority",
-  "fit",
-  "none",
-] as const;
+const leadIntentSchema = z.object({
+  intent: z.enum(["interested", "objection", "send_follow_up", "call_back_later", "not_interested", "unqualified"]),
+  objectionType: z.enum(["budget", "timing", "existing_tools", "authority", "fit", "none"]),
+  shouldCheckCalendar: z.boolean(),
+  shouldBookMeeting: z.boolean(),
+  nextAgentMove: z.enum(["ask_discovery", "handle_objection", "offer_meeting", "offer_email", "close"]),
+  reasoning: z.string(),
+});
 
-const nextAgentMoveValues = [
-  "ask_discovery",
-  "handle_objection",
-  "offer_meeting",
-  "offer_email",
-  "close",
-] as const;
+const jsonOnlyInstruction = "Return only one valid json object. Do not include Markdown, reasoning, or any text outside the json object. Use all required fields and exact enum values.";
 
 const model = () =>
   process.env.GROQ_MODEL ?? "openai/gpt-oss-20b";
@@ -106,19 +105,47 @@ const requireApiKey = () => {
   const apiKey = process.env.GROQ_API_KEY;
 
   if (!apiKey || apiKey === "replace_me") {
-    throw new Error(
-      "AGENT_MODE=llm requires GROQ_API_KEY in .env. Keep AGENT_MODE=deterministic to run without LLM cost.",
-    );
+    throw new Error("GROQ_API_KEY is missing in .env");
   }
 
   return apiKey;
 };
 
-const createLlmClient = () =>
-  new OpenAI({
+let groqClient: OpenAI | undefined;
+const createLlmClient = () => {
+  if (groqClient) return groqClient;
+  groqClient = new OpenAI({
     apiKey: requireApiKey(),
     baseURL: "https://api.groq.com/openai/v1",
+    maxRetries: 0,
+    timeout: 25_000,
   });
+  return groqClient;
+};
+
+const modelError = (error: unknown) => {
+  if (error instanceof OpenAI.APIError) {
+    if (error.status === 401 || error.status === 403) return Object.assign(new Error("Groq rejected GROQ_API_KEY. Check that the key is valid and active."), { status: 502 });
+    if (error.status === 429) return Object.assign(new Error("Groq rate limit or usage quota reached. Wait and retry, or check the Groq console."), { status: 429 });
+    if (error.status === 400) return Object.assign(new Error(`Groq rejected the request (model ${model()}): ${error.message}`), { status: 502 });
+    return Object.assign(new Error(`Groq API error${error.status ? ` (${error.status})` : ""}: ${error.message}`), { status: 502 });
+  }
+  return error instanceof Error ? error : new Error("Unexpected Groq request failure.");
+};
+
+const isStructuredOutputError = (error: unknown) =>
+  error instanceof Error && /failed to (validate|generate) json/i.test(error.message);
+
+const requestCompletion = async (
+  client: OpenAI,
+  request: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
+): Promise<OpenAI.Chat.Completions.ChatCompletion> => {
+  try {
+    return await client.chat.completions.create(request);
+  } catch (error) {
+    throw modelError(error);
+  }
+};
 
 export const runLlmCall = async (leadId: string): Promise<CallResult> => {
   const lead = await getLeadContext(leadId);
@@ -327,7 +354,7 @@ export const startInteractiveLlmCall = async (leadId: string): Promise<CallResul
   statusEvents.push({ status: "agent_speaking", label: `${agentConfig.name} speaking` });
   transcript.push({ speaker: "agent", name: agentConfig.name, message: openingTurn.reply });
 
-  return interactiveCallResult({
+  const result = interactiveCallResult({
     callId: interactiveCallId(lead.id),
     lead,
     transcript,
@@ -336,6 +363,9 @@ export const startInteractiveLlmCall = async (leadId: string): Promise<CallResul
     intentDetections: [],
     latestTurn: openingTurn,
   });
+  await saveCallSummary(result.summary);
+  await writeJsonFile(result, "logs", "calls", `${result.callId}.json`);
+  return result;
 };
 
 export const runInteractiveLlmTurn = async ({
@@ -412,7 +442,7 @@ export const runInteractiveLlmTurn = async ({
     return result;
   }
 
-  if (shouldBookFromReply(intent, transcript, leadReply)) {
+  if (shouldBookFromReply(transcript, leadReply)) {
     statusEvents.push({ status: "thinking", label: "Booking meeting" });
     const slots = await checkCalendarAvailability();
     toolCalls.push({
@@ -552,6 +582,13 @@ export const runInteractiveLlmTurn = async ({
     latestTurn: carlaTurn,
   });
 
+  const savedSummary = await saveCallSummary(result.summary);
+  toolCalls.push({
+    name: "saveCallSummary",
+    input: { summary: result.summary },
+    output: { id: savedSummary.id, path: savedSummary.path },
+  });
+
   await writeJsonFile(result, "logs", "calls", `${result.callId}.json`);
 
   return result;
@@ -562,32 +599,55 @@ const generateCarlaTurn = async (
   lead: Lead,
   transcript: CallResult["transcript"],
 ): Promise<CarlaTurn> => {
-  const response = await client.chat.completions.create({
+  let response: OpenAI.Chat.Completions.ChatCompletion;
+  try {
+    response = await requestCompletion(client, {
     model: model(),
     temperature: 0.3,
     max_tokens: maxOutputTokens(),
     response_format: { type: "json_object" },
     messages: [
-      { role: "system", content: carlaSystemPrompt },
+      { role: "system", content: `${jsonOnlyInstruction}\n\n${carlaSystemPrompt}` },
       {
         role: "user",
         content: JSON.stringify({
           instruction:
-            "Generate Carla's next call turn as JSON. Follow the structured output shape from the system prompt.",
+            "Generate Carla's next call turn as JSON. Follow the structured output shape from the system prompt. Return exactly one valid JSON object. Do not use Markdown fences. Include every required field with the correct types. Use empty arrays where there are no detected items.",
           lead: leadContextForLlm(lead),
           transcript,
         }),
       },
     ],
-  });
+    });
+  } catch (error) {
+    if (isStructuredOutputError(error)) return fallbackCarlaTurn(lead, transcript);
+    throw error;
+  }
   const content = response.choices[0]?.message.content;
 
-  if (!content) {
-    throw new Error("OpenAI returned an empty Carla turn.");
+  if (!content?.trim()) {
+    return fallbackCarlaTurn(lead, transcript);
   }
-
-  return JSON.parse(content) as CarlaTurn;
+  try {
+    const parsed: unknown = JSON.parse(content);
+    const validated = carlaTurnSchema.safeParse(parsed);
+    return validated.success ? validated.data : fallbackCarlaTurn(lead, transcript);
+  } catch {
+    return fallbackCarlaTurn(lead, transcript);
+  }
 };
+
+const fallbackCarlaTurn = (lead: Lead, transcript: CallResult["transcript"]): CarlaTurn => ({
+  reply: transcript.length === 0
+    ? `Hi ${lead.name}, this is Carla. I’m calling about ${lead.discussionTopic}. Is now a good time for a quick question?`
+    : "I want to make sure I understand. Could you tell me a little more about what matters most to your team?",
+  detectedPainPoints: [],
+  detectedObjections: [],
+  interestLevel: "none",
+  recommendedToolCall: { name: "none", reason: "Using a neutral response because the model response could not be validated." },
+  outcome: "interested",
+  nextBestAction: "Continue discovery; no lead signals were inferred from the invalid model response.",
+});
 
 const interactiveCallResult = ({
   callId,
@@ -656,7 +716,9 @@ const detectLeadIntent = async (
   transcript: CallResult["transcript"],
   leadMessage: string,
 ): Promise<LeadIntentDetection> => {
-  const response = await client.chat.completions.create({
+  let response: OpenAI.Chat.Completions.ChatCompletion;
+  try {
+    response = await requestCompletion(client, {
     model: model(),
     temperature: 0.1,
     max_tokens: 180,
@@ -664,14 +726,13 @@ const detectLeadIntent = async (
     messages: [
       {
         role: "system",
-        content:
-          "You classify one lead reply in an outbound sales call. Return only valid JSON. Do not write Carla's reply.",
+        content: `You classify one lead reply in an outbound sales call. ${jsonOnlyInstruction} Do not write Carla's reply.`,
       },
       {
         role: "user",
         content: JSON.stringify({
           instruction:
-            "Classify the latest lead message. Use the exact enum values from the response shape. Set shouldCheckCalendar true only when the lead explicitly asks to schedule, book, discuss calendar availability, or choose a meeting time. Mere interest in a demo/product/help is not enough. Set shouldBookMeeting true only if the lead agreed to a specific available slot, otherwise false.",
+            "Classify the latest lead message. Use the exact enum values from the response shape. Set shouldCheckCalendar true only when the lead explicitly asks to schedule, book, discuss calendar availability, or choose a meeting time. Mere interest in a demo/product/help is not enough. Set shouldBookMeeting true only if the lead agreed to a specific available slot, otherwise false. Return exactly one valid JSON object. No Markdown, no explanations outside JSON. All boolean and enum fields must have their required types.",
           responseShape: {
             intent:
               "interested | objection | send_follow_up | call_back_later | not_interested | unqualified",
@@ -688,34 +749,28 @@ const detectLeadIntent = async (
         }),
       },
     ],
-  });
+    });
+  } catch (error) {
+    if (!isStructuredOutputError(error)) throw error;
+    return {
+      leadMessage, intent: "unqualified", objectionType: "none", shouldCheckCalendar: false,
+      shouldBookMeeting: false, nextAgentMove: "ask_discovery",
+      reasoning: "Intent could not be validated; no booking or calendar action was inferred.",
+    };
+  }
   const content = response.choices[0]?.message.content;
 
-  if (!content) {
-    throw new Error("OpenAI returned an empty lead intent classification.");
+  let parsed: unknown;
+  try { parsed = content?.trim() ? JSON.parse(content) : undefined; } catch { parsed = undefined; }
+  const validated = leadIntentSchema.safeParse(parsed);
+  if (!validated.success) {
+    return {
+      leadMessage, intent: "unqualified", objectionType: "none", shouldCheckCalendar: false,
+      shouldBookMeeting: false, nextAgentMove: "ask_discovery",
+      reasoning: "Intent could not be validated; no booking or calendar action was inferred.",
+    };
   }
-
-  const parsed = JSON.parse(content) as Partial<Omit<LeadIntentDetection, "leadMessage">>;
-
-  return {
-    leadMessage,
-    intent: leadIntentValues.includes(parsed.intent as LeadIntentDetection["intent"])
-      ? (parsed.intent as LeadIntentDetection["intent"])
-      : "unqualified",
-    objectionType: objectionTypeValues.includes(
-      parsed.objectionType as LeadIntentDetection["objectionType"],
-    )
-      ? (parsed.objectionType as LeadIntentDetection["objectionType"])
-      : "none",
-    shouldCheckCalendar: Boolean(parsed.shouldCheckCalendar),
-    shouldBookMeeting: Boolean(parsed.shouldBookMeeting),
-    nextAgentMove: nextAgentMoveValues.includes(
-      parsed.nextAgentMove as LeadIntentDetection["nextAgentMove"],
-    )
-      ? (parsed.nextAgentMove as LeadIntentDetection["nextAgentMove"])
-      : "close",
-    reasoning: parsed.reasoning ?? "No model reasoning provided.",
-  };
+  return { leadMessage, ...validated.data };
 };
 
 const leadContextForLlm = (lead: Lead): LeadContextForLlm => {
@@ -802,23 +857,23 @@ const shouldSendTimeSlotsByEmail = (
   return asksForSlots && (mentionsEmail || followsNoSlotMessage);
 };
 
-const shouldBookFromReply = (
-  intent: LeadIntentDetection,
-  transcript: CallTranscriptEntry[],
-  leadReply: string,
-) => {
+const shouldBookFromReply = (transcript: CallTranscriptEntry[], leadReply: string) => {
   const normalized = leadReply.toLowerCase();
   const previousAgentMessage = [...transcript]
     .reverse()
     .find((entry) => entry.speaker === "agent")?.message.toLowerCase();
-  const hasOfferedSlots =
-    previousAgentMessage?.includes("option 1") || previousAgentMessage?.includes("available slots");
-
-  return (
-    intent.shouldBookMeeting ||
-    (Boolean(hasOfferedSlots) &&
-      /\b(ok|yes|works|book|confirm|that works|sounds good|option 1|first)\b/.test(normalized))
-  );
+  if (!previousAgentMessage?.includes("option 1")) return false;
+  const offeredOptions = [...previousAgentMessage.matchAll(/option\s+(\d+):\s*([^;]+)/g)];
+  if (offeredOptions.length === 0) return false;
+  const explicitAgreement = /\b(ok|yes|works|book|confirm|that works|sounds good|go ahead)\b/.test(normalized);
+  if (!explicitAgreement) return false;
+  if (offeredOptions.length === 1) return true;
+  return offeredOptions.some(([, number, details]) => {
+    if (new RegExp(`\\boption\\s*${number}\\b`).test(normalized)) return true;
+    const time = details.match(/\b\d{1,2}:\d{2}\s*(?:am|pm)\b/i)?.[0];
+    const date = details.match(/\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+\d{1,2}\b/i)?.[0];
+    return Boolean(time && normalized.includes(time.toLowerCase()) && (!date || normalized.includes(date.toLowerCase())));
+  });
 };
 
 const calendarOptionsMessage = (slots: CalendarSlot[], lead: Lead) => {
@@ -839,7 +894,7 @@ const formatSlot = (slot: CalendarSlot) =>
   new Intl.DateTimeFormat("en-US", {
     dateStyle: "medium",
     timeStyle: "short",
-    timeZone: "Asia/Jerusalem",
+    timeZone: "Asia/Kolkata",
   }).format(new Date(slot.startsAt));
 
 const collectSignals = (

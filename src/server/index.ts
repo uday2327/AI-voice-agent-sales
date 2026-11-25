@@ -23,8 +23,12 @@ app.use("/api", vapiRouter);
 
 const errorHandler: ErrorRequestHandler = (error, _req, res, _next) => {
   const message = error instanceof Error ? error.message : "Unexpected server error";
+  const status =
+    error && typeof error === "object" && "status" in error && typeof error.status === "number"
+      ? error.status
+      : 400;
 
-  res.status(400).json({ error: message });
+  res.status(status).json({ error: message });
 };
 
 app.use(errorHandler);
