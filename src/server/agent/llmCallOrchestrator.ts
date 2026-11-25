@@ -75,7 +75,8 @@ const nextAgentMoveValues = [
   "close",
 ] as const;
 
-const model = () => process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
+const model = () =>
+  process.env.GROQ_MODEL ?? "openai/gpt-oss-20b";
 
 const maxOutputTokens = () => {
   const parsed = Number(process.env.MAX_OUTPUT_TOKENS ?? 220);
@@ -102,20 +103,26 @@ const interactiveCallId = (leadId: string) =>
   `${leadId}-interactive-${new Date().toISOString().replaceAll(/[:.]/g, "-")}`;
 
 const requireApiKey = () => {
-  const apiKey = process.env.OPENAI_API_KEY;
+  const apiKey = process.env.GROQ_API_KEY;
 
   if (!apiKey || apiKey === "replace_me") {
     throw new Error(
-      "AGENT_MODE=llm requires OPENAI_API_KEY in .env. Keep AGENT_MODE=deterministic to run without LLM cost.",
+      "AGENT_MODE=llm requires GROQ_API_KEY in .env. Keep AGENT_MODE=deterministic to run without LLM cost.",
     );
   }
 
   return apiKey;
 };
 
+const createLlmClient = () =>
+  new OpenAI({
+    apiKey: requireApiKey(),
+    baseURL: "https://api.groq.com/openai/v1",
+  });
+
 export const runLlmCall = async (leadId: string): Promise<CallResult> => {
   const lead = await getLeadContext(leadId);
-  const client = new OpenAI({ apiKey: requireApiKey() });
+  const client = createLlmClient();
   const id = callId(lead.id);
   const transcript: CallResult["transcript"] = [];
   const statusEvents: CallResult["statusEvents"] = [];
@@ -304,7 +311,7 @@ export const runLlmCall = async (leadId: string): Promise<CallResult> => {
 
 export const startInteractiveLlmCall = async (leadId: string): Promise<CallResult> => {
   const lead = await getLeadContext(leadId);
-  const client = new OpenAI({ apiKey: requireApiKey() });
+  const client = createLlmClient();
   const transcript: CallResult["transcript"] = [];
   const statusEvents: CallResult["statusEvents"] = [{ status: "thinking", label: "Loading lead context" }];
   const toolCalls: CallToolCall[] = [
@@ -343,7 +350,7 @@ export const runInteractiveLlmTurn = async ({
   leadReply: string;
 }): Promise<CallResult> => {
   const lead = await getLeadContext(leadId);
-  const client = new OpenAI({ apiKey: requireApiKey() });
+  const client = createLlmClient();
   const toolCalls: CallToolCall[] = [];
   const nextTranscript: CallResult["transcript"] = [
     ...transcript,
