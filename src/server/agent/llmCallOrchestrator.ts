@@ -64,6 +64,7 @@ const carlaTurnSchema = z.object({
 });
 
 const leadIntentSchema = z.object({
+  leadMessage: z.string(),
   intent: z.enum(["interested", "objection", "send_follow_up", "call_back_later", "not_interested", "unqualified"]),
   objectionType: z.enum(["budget", "timing", "existing_tools", "authority", "fit", "none"]),
   shouldCheckCalendar: z.boolean(),
@@ -72,7 +73,60 @@ const leadIntentSchema = z.object({
   reasoning: z.string(),
 });
 
-const jsonOnlyInstruction = "Return only one valid json object. Do not include Markdown, reasoning, or any text outside the json object. Use all required fields and exact enum values.";
+const interactiveTurnSchema = z.object({
+  carlaTurn: carlaTurnSchema,
+  leadIntent: leadIntentSchema,
+});
+
+const carlaTurnJsonSchema = {
+  type: "object",
+  properties: {
+    reply: { type: "string" },
+    detectedPainPoints: { type: "array", items: { type: "string" } },
+    detectedObjections: { type: "array", items: { type: "string" } },
+    interestLevel: { type: "string", enum: ["high", "medium", "low", "none"] },
+    recommendedToolCall: {
+      type: "object",
+      properties: {
+        name: { type: "string", enum: ["getLeadContext", "checkCalendarAvailability", "bookMeeting", "saveCallSummary", "classifyLeadOutcome", "none"] },
+        reason: { type: "string" },
+      },
+      required: ["name", "reason"],
+      additionalProperties: false,
+    },
+    outcome: { type: "string", enum: ["meeting_booked", "interested", "send_follow_up", "call_back_later", "not_interested", "unqualified"] },
+    nextBestAction: { type: "string" },
+  },
+  required: ["reply", "detectedPainPoints", "detectedObjections", "interestLevel", "recommendedToolCall", "outcome", "nextBestAction"],
+  additionalProperties: false,
+} as const;
+
+const leadIntentJsonSchema = {
+  type: "object",
+  properties: {
+    leadMessage: { type: "string" },
+    intent: { type: "string", enum: ["interested", "objection", "send_follow_up", "call_back_later", "not_interested", "unqualified"] },
+    objectionType: { type: "string", enum: ["budget", "timing", "existing_tools", "authority", "fit", "none"] },
+    shouldCheckCalendar: { type: "boolean" },
+    shouldBookMeeting: { type: "boolean" },
+    nextAgentMove: { type: "string", enum: ["ask_discovery", "handle_objection", "offer_meeting", "offer_email", "close"] },
+    reasoning: { type: "string" },
+  },
+  required: ["leadMessage", "intent", "objectionType", "shouldCheckCalendar", "shouldBookMeeting", "nextAgentMove", "reasoning"],
+  additionalProperties: false,
+} as const;
+
+const interactiveTurnJsonSchema = {
+  type: "object",
+  properties: {
+    carlaTurn: carlaTurnJsonSchema,
+    leadIntent: leadIntentJsonSchema,
+  },
+  required: ["carlaTurn", "leadIntent"],
+  additionalProperties: false,
+} as const;
+
+const interactiveSystemPrompt = `You are Carla, an AI SDR calling a business lead. Be concise, natural, and ask one question at a time. Qualify the lead and handle objections calmly. Explain only that AI agents can help sales teams with follow-up and prioritization; do not invent pricing, integrations, customer examples, or product guarantees. If asked about price or cost, say you do not have confirmed pricing details and a sales representative can confirm current pricing. Use the full conversation context and address the latest lead message directly. Classify intent only from what the lead said. Check calendar only when the lead explicitly asks to discuss or schedule a meeting. Never book from interest alone; booking is handled by the server only after explicit acceptance of a specific offered slot. Do not invoke functions or tools; the recommendedToolCall field is JSON data for the backend. Return the required structured fields with concise reasoning.`;
 
 const model = () =>
   process.env.GROQ_MODEL ?? "openai/gpt-oss-20b";
@@ -125,26 +179,70 @@ const createLlmClient = () => {
 
 const modelError = (error: unknown) => {
   if (error instanceof OpenAI.APIError) {
-    if (error.status === 401 || error.status === 403) return Object.assign(new Error("Groq rejected GROQ_API_KEY. Check that the key is valid and active."), { status: 502 });
-    if (error.status === 429) return Object.assign(new Error("Groq rate limit or usage quota reached. Wait and retry, or check the Groq console."), { status: 429 });
-    if (error.status === 400) return Object.assign(new Error(`Groq rejected the request (model ${model()}): ${error.message}`), { status: 502 });
-    return Object.assign(new Error(`Groq API error${error.status ? ` (${error.status})` : ""}: ${error.message}`), { status: 502 });
+    const code = typeof error.code === "string" ? ` ${error.code}` : "";
+    if (error.status === 401 || error.status === 403) return Object.assign(new Error(`Groq rejected GROQ_API_KEY: ${error.message}`), { status: 502 });
+    if (error.status === 429) return Object.assign(new Error(`Groq rate limit reached (429). Wait for the TPM window to reset and try again. ${error.message}`), { status: 429 });
+    if (error.status === 400) return Object.assign(new Error(`Groq rejected structured output for model ${model()}${code}: ${error.message}`), { status: 502 });
+    return Object.assign(new Error(`Groq API error${error.status ? ` (${error.status})` : ""}${code}: ${error.message}`), { status: 502 });
   }
   return error instanceof Error ? error : new Error("Unexpected Groq request failure.");
 };
 
-const isStructuredOutputError = (error: unknown) =>
-  error instanceof Error && /failed to (validate|generate) json/i.test(error.message);
+const jsonValidationFailure = (error: unknown) =>
+  error instanceof OpenAI.APIError && error.status === 400 &&
+  (error.code === "json_validate_failed" || error.code === "tool_use_failed" || error.code === "output_parse_failed" || /json_validate_failed|output_parse_failed|failed to validate json|parsing failed.*output could not be parsed|tool choice is none.*model called a tool/i.test(error.message));
 
-const requestCompletion = async (
-  client: OpenAI,
-  request: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
-): Promise<OpenAI.Chat.Completions.ChatCompletion> => {
+class InvalidStructuredResponseError extends Error {
+  status = 502;
+}
+
+const parseStructuredContent = <T>(
+  content: string | null | undefined,
+  schema: z.ZodType<T>,
+  schemaName: string,
+): T => {
+  if (!content?.trim()) throw new InvalidStructuredResponseError(`Groq returned an empty ${schemaName} response.`);
+  let parsed: unknown;
   try {
-    return await client.chat.completions.create(request);
-  } catch (error) {
-    throw modelError(error);
+    parsed = JSON.parse(content);
+  } catch {
+    throw new InvalidStructuredResponseError(`Groq returned malformed JSON for ${schemaName}.`);
   }
+  const validated = schema.safeParse(parsed);
+  if (!validated.success) {
+    throw new InvalidStructuredResponseError(`Groq returned a ${schemaName} response that did not match its schema: ${validated.error.issues.map((issue) => issue.path.join(".") || "response").join(", ")}.`);
+  }
+  return validated.data;
+};
+
+const requestCompletion = async <T>(
+  client: OpenAI,
+  request: Omit<OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming, "response_format">,
+  schemaName: string,
+  schema: typeof carlaTurnJsonSchema | typeof leadIntentJsonSchema | typeof interactiveTurnJsonSchema,
+  validator: z.ZodType<T>,
+): Promise<T> => {
+  const structuredRequest: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming = {
+    ...request,
+    response_format: { type: "json_schema", json_schema: { name: schemaName, strict: true, schema } },
+  };
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await client.chat.completions.create(structuredRequest);
+      return parseStructuredContent(response.choices[0]?.message.content, validator, schemaName);
+    } catch (error) {
+      const canRetry = attempt === 0 && (jsonValidationFailure(error) || error instanceof InvalidStructuredResponseError);
+      if (!canRetry) {
+        if (error instanceof InvalidStructuredResponseError) throw error;
+        throw modelError(error);
+      }
+      structuredRequest.messages = [
+        { role: "system", content: "Retry once. Follow the strict JSON schema exactly; include every required field and enum. Do not invoke functions, tools, or tool calls. Put recommendedToolCall only in the JSON data." },
+        ...structuredRequest.messages,
+      ];
+    }
+  }
+  throw new InvalidStructuredResponseError(`Groq could not return a valid ${schemaName} response after one retry.`);
 };
 
 export const runLlmCall = async (leadId: string): Promise<CallResult> => {
@@ -388,11 +486,10 @@ export const runInteractiveLlmTurn = async ({
   ];
   const statusEvents: CallResult["statusEvents"] = [
     { status: "lead_speaking", label: `${lead.name} speaking` },
-    { status: "thinking", label: "Reading lead intent" },
+    { status: "thinking", label: "Carla is processing the lead response" },
   ];
-  const intent = await detectLeadIntent(client, lead, nextTranscript, leadReply);
-
   if (shouldSendTimeSlotsByEmail(leadReply, transcript)) {
+    const intent = ruleIntent(leadReply, "send_follow_up", "offer_email", "Lead explicitly requested follow-up by email.");
     const summary: CallSummary = {
       leadId: lead.id,
       leadName: lead.name,
@@ -442,7 +539,9 @@ export const runInteractiveLlmTurn = async ({
     return result;
   }
 
-  if (shouldBookFromReply(transcript, leadReply)) {
+  const acceptedCalendarOption = acceptedCalendarOptionFromReply(transcript, leadReply);
+  if (acceptedCalendarOption) {
+    const intent = ruleIntent(leadReply, "interested", "close", "Lead explicitly accepted a specific offered meeting slot.", true);
     statusEvents.push({ status: "thinking", label: "Booking meeting" });
     const slots = await checkCalendarAvailability();
     toolCalls.push({
@@ -450,7 +549,9 @@ export const runInteractiveLlmTurn = async ({
       input: {},
       output: slots,
     });
-    const slot = slots[0];
+    const slot = slots.find((availableSlot) =>
+      offeredSlotMatches(availableSlot, acceptedCalendarOption.details),
+    );
 
     if (slot) {
       const meeting = await bookMeeting(
@@ -511,9 +612,49 @@ export const runInteractiveLlmTurn = async ({
 
       return result;
     }
+
+    const message = calendarOptionsMessage(slots, isPricingQuestion(leadReply));
+    const unavailableIntent = ruleIntent(
+      leadReply,
+      "interested",
+      "offer_meeting",
+      "The lead accepted an offered slot, but it is no longer available.",
+    );
+    statusEvents.push({ status: "agent_speaking", label: `${agentConfig.name} speaking` });
+    nextTranscript.push({ speaker: "agent", name: agentConfig.name, message });
+    const result = interactiveCallResult({
+      callId: callId ?? interactiveCallId(lead.id),
+      lead,
+      transcript: nextTranscript,
+      toolCalls,
+      statusEvents,
+      intentDetections: [unavailableIntent],
+      latestTurn: {
+        reply: message,
+        detectedPainPoints: [],
+        detectedObjections: [],
+        interestLevel: "high",
+        recommendedToolCall: {
+          name: "checkCalendarAvailability",
+          reason: "The previously offered time is no longer available.",
+        },
+        outcome: "interested",
+        nextBestAction: "Wait for the lead to choose an available slot.",
+      },
+    });
+    const savedSummary = await saveCallSummary(result.summary);
+    toolCalls.push({
+      name: "saveCallSummary",
+      input: { summary: result.summary },
+      output: { id: savedSummary.id, path: savedSummary.path },
+    });
+    await writeJsonFile(result, "logs", "calls", `${result.callId}.json`);
+    return result;
   }
 
-  if (shouldOfferCalendarOptions(intent, leadReply, transcript)) {
+  const { carlaTurn, leadIntent: intent } = await generateInteractiveTurn(client, lead, nextTranscript, leadReply);
+
+  if (shouldOfferCalendarOptions(leadReply, transcript)) {
     statusEvents.push({ status: "thinking", label: "Checking calendar availability" });
     const slots = await checkCalendarAvailability();
     toolCalls.push({
@@ -521,7 +662,7 @@ export const runInteractiveLlmTurn = async ({
       input: {},
       output: slots,
     });
-    const message = calendarOptionsMessage(slots, lead);
+    const message = calendarOptionsMessage(slots);
     statusEvents.push({ status: "agent_speaking", label: `${agentConfig.name} speaking` });
     nextTranscript.push({ speaker: "agent", name: agentConfig.name, message });
 
@@ -533,9 +674,8 @@ export const runInteractiveLlmTurn = async ({
       statusEvents,
       intentDetections: [intent],
       latestTurn: {
+        ...carlaTurn,
         reply: message,
-        detectedPainPoints: [],
-        detectedObjections: [],
         interestLevel: "high",
         recommendedToolCall: {
           name: "checkCalendarAvailability",
@@ -546,13 +686,18 @@ export const runInteractiveLlmTurn = async ({
       },
     });
 
+    const savedSummary = await saveCallSummary(result.summary);
+    toolCalls.push({
+      name: "saveCallSummary",
+      input: { summary: result.summary },
+      output: { id: savedSummary.id, path: savedSummary.path },
+    });
     await writeJsonFile(result, "logs", "calls", `${result.callId}.json`);
 
     return result;
   }
 
   statusEvents.push({ status: "thinking", label: "Carla is reasoning from lead response" });
-  const carlaTurn = await generateCarlaTurn(client, lead, nextTranscript);
   if (carlaPromisedCalendarCheck(carlaTurn)) {
     statusEvents.push({ status: "thinking", label: "Checking calendar availability" });
     const slots = await checkCalendarAvailability();
@@ -561,13 +706,16 @@ export const runInteractiveLlmTurn = async ({
       input: {},
       output: slots,
     });
-    carlaTurn.reply = `${carlaTurn.reply} ${calendarOptionsMessage(slots, lead)}`;
+    carlaTurn.reply = calendarOptionsMessage(slots, isPricingQuestion(leadReply));
     carlaTurn.recommendedToolCall = {
       name: "checkCalendarAvailability",
       reason: "Carla promised to check calendar availability.",
     };
     carlaTurn.outcome = "interested";
     carlaTurn.nextBestAction = "Wait for the lead to choose or confirm one of the offered slots.";
+  }
+  if (isPricingQuestion(leadReply)) {
+    carlaTurn.reply = pricingAnswer();
   }
   statusEvents.push({ status: "agent_speaking", label: `${agentConfig.name} speaking` });
   nextTranscript.push({ speaker: "agent", name: agentConfig.name, message: carlaTurn.reply });
@@ -594,60 +742,72 @@ export const runInteractiveLlmTurn = async ({
   return result;
 };
 
+const generateInteractiveTurn = async (
+  client: OpenAI,
+  lead: Lead,
+  transcript: CallResult["transcript"],
+  latestLeadMessage: string,
+) => {
+  const response = await requestCompletion(client, {
+    model: model(),
+    max_tokens: maxOutputTokens(),
+    reasoning_effort: "low",
+    messages: [
+      { role: "system", content: interactiveSystemPrompt },
+      {
+        role: "user",
+        content: JSON.stringify({
+          lead: leadContextForLlm(lead),
+          conversation: transcriptForModel(transcript.slice(0, -1)),
+          latestLeadMessage,
+        }),
+      },
+    ],
+  }, "carla_interactive_turn", interactiveTurnJsonSchema, interactiveTurnSchema);
+
+  return {
+    carlaTurn: response.carlaTurn,
+    leadIntent: { ...response.leadIntent, leadMessage: latestLeadMessage },
+  };
+};
+
+const ruleIntent = (
+  leadMessage: string,
+  intent: LeadIntentDetection["intent"],
+  nextAgentMove: LeadIntentDetection["nextAgentMove"],
+  reasoning: string,
+  shouldBookMeeting = false,
+): LeadIntentDetection => ({
+  leadMessage,
+  intent,
+  objectionType: "none",
+  shouldCheckCalendar: false,
+  shouldBookMeeting,
+  nextAgentMove,
+  reasoning,
+});
+
 const generateCarlaTurn = async (
   client: OpenAI,
   lead: Lead,
   transcript: CallResult["transcript"],
 ): Promise<CarlaTurn> => {
-  let response: OpenAI.Chat.Completions.ChatCompletion;
-  try {
-    response = await requestCompletion(client, {
+  return requestCompletion(client, {
     model: model(),
-    temperature: 0.3,
     max_tokens: maxOutputTokens(),
-    response_format: { type: "json_object" },
+    reasoning_effort: "low",
     messages: [
-      { role: "system", content: `${jsonOnlyInstruction}\n\n${carlaSystemPrompt}` },
+      { role: "system", content: `${carlaSystemPrompt}\n\nReturn one JSON object conforming exactly to the provided strict schema.` },
       {
         role: "user",
         content: JSON.stringify({
-          instruction:
-            "Generate Carla's next call turn as JSON. Follow the structured output shape from the system prompt. Return exactly one valid JSON object. Do not use Markdown fences. Include every required field with the correct types. Use empty arrays where there are no detected items.",
           lead: leadContextForLlm(lead),
-          transcript,
+          transcript: transcriptForModel(transcript),
         }),
       },
     ],
-    });
-  } catch (error) {
-    if (isStructuredOutputError(error)) return fallbackCarlaTurn(lead, transcript);
-    throw error;
-  }
-  const content = response.choices[0]?.message.content;
-
-  if (!content?.trim()) {
-    return fallbackCarlaTurn(lead, transcript);
-  }
-  try {
-    const parsed: unknown = JSON.parse(content);
-    const validated = carlaTurnSchema.safeParse(parsed);
-    return validated.success ? validated.data : fallbackCarlaTurn(lead, transcript);
-  } catch {
-    return fallbackCarlaTurn(lead, transcript);
-  }
+  }, "carla_turn", carlaTurnJsonSchema, carlaTurnSchema);
 };
-
-const fallbackCarlaTurn = (lead: Lead, transcript: CallResult["transcript"]): CarlaTurn => ({
-  reply: transcript.length === 0
-    ? `Hi ${lead.name}, this is Carla. I’m calling about ${lead.discussionTopic}. Is now a good time for a quick question?`
-    : "I want to make sure I understand. Could you tell me a little more about what matters most to your team?",
-  detectedPainPoints: [],
-  detectedObjections: [],
-  interestLevel: "none",
-  recommendedToolCall: { name: "none", reason: "Using a neutral response because the model response could not be validated." },
-  outcome: "interested",
-  nextBestAction: "Continue discovery; no lead signals were inferred from the invalid model response.",
-});
 
 const interactiveCallResult = ({
   callId,
@@ -716,61 +876,42 @@ const detectLeadIntent = async (
   transcript: CallResult["transcript"],
   leadMessage: string,
 ): Promise<LeadIntentDetection> => {
-  let response: OpenAI.Chat.Completions.ChatCompletion;
-  try {
-    response = await requestCompletion(client, {
+  const intent = await requestCompletion(client, {
     model: model(),
-    temperature: 0.1,
-    max_tokens: 180,
-    response_format: { type: "json_object" },
+    max_tokens: maxOutputTokens(),
+    reasoning_effort: "low",
     messages: [
       {
         role: "system",
-        content: `You classify one lead reply in an outbound sales call. ${jsonOnlyInstruction} Do not write Carla's reply.`,
+        content: "Classify the lead's latest message in this sales conversation. Copy the latest message exactly into leadMessage. Do not generate a reply.",
       },
       {
         role: "user",
         content: JSON.stringify({
-          instruction:
-            "Classify the latest lead message. Use the exact enum values from the response shape. Set shouldCheckCalendar true only when the lead explicitly asks to schedule, book, discuss calendar availability, or choose a meeting time. Mere interest in a demo/product/help is not enough. Set shouldBookMeeting true only if the lead agreed to a specific available slot, otherwise false. Return exactly one valid JSON object. No Markdown, no explanations outside JSON. All boolean and enum fields must have their required types.",
-          responseShape: {
-            intent:
-              "interested | objection | send_follow_up | call_back_later | not_interested | unqualified",
-            objectionType: "budget | timing | existing_tools | authority | fit | none",
-            shouldCheckCalendar: "boolean",
-            shouldBookMeeting: "boolean",
-            nextAgentMove:
-              "ask_discovery | handle_objection | offer_meeting | offer_email | close",
-            reasoning: "brief reason",
-          },
           leadContext: leadContextForLlm(lead),
-          transcript,
+          transcript: transcriptForModel(transcript.slice(0, -1)),
           latestLeadMessage: leadMessage,
         }),
       },
     ],
-    });
-  } catch (error) {
-    if (!isStructuredOutputError(error)) throw error;
-    return {
-      leadMessage, intent: "unqualified", objectionType: "none", shouldCheckCalendar: false,
-      shouldBookMeeting: false, nextAgentMove: "ask_discovery",
-      reasoning: "Intent could not be validated; no booking or calendar action was inferred.",
-    };
-  }
-  const content = response.choices[0]?.message.content;
+  }, "lead_intent", leadIntentJsonSchema, leadIntentSchema);
+  return { ...intent, leadMessage };
+};
 
-  let parsed: unknown;
-  try { parsed = content?.trim() ? JSON.parse(content) : undefined; } catch { parsed = undefined; }
-  const validated = leadIntentSchema.safeParse(parsed);
-  if (!validated.success) {
-    return {
-      leadMessage, intent: "unqualified", objectionType: "none", shouldCheckCalendar: false,
-      shouldBookMeeting: false, nextAgentMove: "ask_discovery",
-      reasoning: "Intent could not be validated; no booking or calendar action was inferred.",
-    };
-  }
-  return { leadMessage, ...validated.data };
+const transcriptForModel = (transcript: CallResult["transcript"]) => {
+  const recent = transcript.slice(-14).map((entry) => ({
+    speaker: entry.speaker,
+    message: entry.message.slice(0, 400),
+  }));
+  const earlierLeadMessages = transcript.slice(0, -14)
+    .filter((entry) => entry.speaker === "lead")
+    .slice(-6)
+    .map((entry) => entry.message.slice(0, 200));
+
+  return {
+    earlierLeadContext: earlierLeadMessages.length ? earlierLeadMessages : undefined,
+    recentConversation: recent,
+  };
 };
 
 const leadContextForLlm = (lead: Lead): LeadContextForLlm => {
@@ -786,7 +927,6 @@ const shouldForceScriptedBooking = (lead: Lead, leadReply: string) =>
   );
 
 const shouldOfferCalendarOptions = (
-  intent: LeadIntentDetection,
   leadReply: string,
   transcript: CallTranscriptEntry[],
 ) => {
@@ -802,27 +942,19 @@ const shouldOfferCalendarOptions = (
       normalized,
     );
   const explicitlyAskedToSchedule =
-    /\b(book|schedule|set up|set-up|arrange)\b.{0,32}\b(meeting|demo|call|time|slot)\b/.test(
+    /\b(book|schedule|set up|set-up|arrange|plan)\b.{0,40}\b(meeting|demo|demonstration|call|time|slot)\b/.test(
       normalized,
     ) ||
-    /\b(meeting|demo|call|time slot|time slots|availability|calendar)\b.{0,32}\b(book|schedule|available|work|works)\b/.test(
+    /\b(meeting|demo|demonstration|call|time slot|time slots|availability|calendar)\b.{0,40}\b(book|schedule|available|work|works)\b/.test(
       normalized,
     ) ||
-    /\b(when are you available|what times|which time|send.*time slot|send.*available time)\b/.test(
+    /\b(when are you available|what times|which time|send.*time slot|send.*available time|can we (?:schedule|book|arrange).{0,40}\b(demo|demonstration|meeting|call)\b)\b/.test(
       normalized,
     );
   const shouldContinuePromisedCalendarCheck =
     carlaAlreadySaidSheWillCheck && leadAsksForCheckResult;
 
-  return (
-    shouldContinuePromisedCalendarCheck ||
-    (explicitlyAskedToSchedule &&
-      (intent.shouldCheckCalendar ||
-        intent.nextAgentMove === "offer_meeting" ||
-        /\b(book|meeting|demo|call|calendar|schedule|available|availability|time slot|time slots)\b/.test(
-          normalized,
-        )))
-  );
+  return shouldContinuePromisedCalendarCheck || explicitlyAskedToSchedule;
 };
 
 const carlaPromisedCalendarCheck = (turn: CarlaTurn) => {
@@ -857,37 +989,61 @@ const shouldSendTimeSlotsByEmail = (
   return asksForSlots && (mentionsEmail || followsNoSlotMessage);
 };
 
-const shouldBookFromReply = (transcript: CallTranscriptEntry[], leadReply: string) => {
+const acceptedCalendarOptionFromReply = (transcript: CallTranscriptEntry[], leadReply: string) => {
   const normalized = leadReply.toLowerCase();
   const previousAgentMessage = [...transcript]
     .reverse()
     .find((entry) => entry.speaker === "agent")?.message.toLowerCase();
-  if (!previousAgentMessage?.includes("option 1")) return false;
+  if (!previousAgentMessage?.includes("option 1")) return null;
   const offeredOptions = [...previousAgentMessage.matchAll(/option\s+(\d+):\s*([^;]+)/g)];
-  if (offeredOptions.length === 0) return false;
+  if (offeredOptions.length === 0) return null;
   const explicitAgreement = /\b(ok|yes|works|book|confirm|that works|sounds good|go ahead)\b/.test(normalized);
-  if (!explicitAgreement) return false;
-  if (offeredOptions.length === 1) return true;
-  return offeredOptions.some(([, number, details]) => {
-    if (new RegExp(`\\boption\\s*${number}\\b`).test(normalized)) return true;
+  if (!explicitAgreement) return null;
+  if (offeredOptions.length === 1) {
+    const [, number, details] = offeredOptions[0];
+    return { number: Number(number), details };
+  }
+  for (const [, number, details] of offeredOptions) {
+    if (new RegExp(`\\boption\\s*${number}\\b`).test(normalized)) {
+      return { number: Number(number), details };
+    }
     const time = details.match(/\b\d{1,2}:\d{2}\s*(?:am|pm)\b/i)?.[0];
     const date = details.match(/\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+\d{1,2}\b/i)?.[0];
-    return Boolean(time && normalized.includes(time.toLowerCase()) && (!date || normalized.includes(date.toLowerCase())));
-  });
+    if (time && normalized.includes(time.toLowerCase()) && (!date || normalized.includes(date.toLowerCase()))) {
+      return { number: Number(number), details };
+    }
+  }
+  return null;
 };
 
-const calendarOptionsMessage = (slots: CalendarSlot[], lead: Lead) => {
+const offeredSlotMatches = (slot: CalendarSlot, offeredDetails: string) => {
+  const offered = offeredDetails.match(/^(.*?)\s+with\s+(.+)$/i);
+  return Boolean(
+    offered &&
+    formatSlot(slot).toLowerCase() === offered[1].trim().toLowerCase() &&
+    slot.salesRep.toLowerCase() === offered[2].trim().toLowerCase(),
+  );
+};
+
+const isPricingQuestion = (message: string) =>
+  /\b(price|pricing|cost|how much|what does .* cost)\b/i.test(message);
+
+const pricingAnswer = () =>
+  "I don’t have confirmed pricing details to share. A sales representative can confirm current pricing for you.";
+
+const calendarOptionsMessage = (slots: CalendarSlot[], includePricingAnswer = false) => {
   const availableSlots = slots.slice(0, 2);
+  const pricingLeadIn = includePricingAnswer ? `${pricingAnswer()} ` : "";
 
   if (availableSlots.length === 0) {
-    return "I do not see an open slot in the mock calendar right now, so I will have the sales team follow up with available times.";
+    return `${pricingLeadIn}I do not see an open slot in the mock calendar right now, so I will have the sales team follow up with available times.`;
   }
 
   const options = availableSlots
     .map((slot, index) => `Option ${index + 1}: ${formatSlot(slot)} with ${slot.salesRep}`)
     .join("; ");
 
-  return `Absolutely. Since you are evaluating whether AI agents can help with ${lead.discussionTopic.toLowerCase()}, a short meeting is the right place to map that to your current workflow. I checked the calendar and can offer ${options}. Which one works best for you?`;
+  return `${pricingLeadIn}I checked the calendar and can offer ${options}. Which one works best for you?`;
 };
 
 const formatSlot = (slot: CalendarSlot) =>
