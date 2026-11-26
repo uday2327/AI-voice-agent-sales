@@ -117,7 +117,11 @@ declare global {
 }
 
 const carlaImageSrc = '/Gemini_Generated_Image_l56rq4l56rq4l56r.png'
+const frontendAgentName = 'Alexy'
 const voiceSubmitDelayMs = 4000
+
+const displayAgentMessage = (message: string) =>
+  message.replace(/\bCarla\b/gi, frontendAgentName)
 
 const toolLabels: Record<string, string> = {
   getLeadContext: 'CRM loaded',
@@ -246,10 +250,14 @@ function App() {
       : call.transcript.slice(0, visibleCount)
   }, [activeCallMode, call, visibleCount])
 
-  const currentAgent = call?.agent ?? agentProfile
   const selectedLead = call?.lead ?? leads.find((lead) => lead.id === selectedLeadId) ?? null
-  const agentName = currentAgent?.name ?? 'Carla'
-  const agentRole = currentAgent?.role ?? 'AI SDR agent'
+  const displayAgent = {
+    ...(call?.agent ?? agentProfile),
+    name: frontendAgentName,
+    role: 'AI SDR Agent',
+  }
+  const agentName = displayAgent.name
+  const agentRole = displayAgent.role
   const latestIntent = call?.intentDetections?.[call.intentDetections.length - 1]
   const serverSignals = useMemo(() => {
     const signals = call?.toolCalls.map((toolCall) => toolLabels[toolCall.name] ?? toolCall.name) ?? []
@@ -406,7 +414,7 @@ function App() {
     queueVapiAgentTurn({
       endCallAfterSpoken: visibleCount === call.transcript.length - 1,
       index: visibleCount,
-      message: nextEntry.message,
+      message: displayAgentMessage(nextEntry.message),
     })
   }, [activeStartMode, call, vapiVoiceActive, visibleCount])
 
@@ -427,7 +435,7 @@ function App() {
 
   const beginCall = async () => {
     if (!selectedLeadId) {
-      setError('Choose who Carla is calling before starting.')
+      setError(`Choose who ${frontendAgentName} is calling before starting.`)
       return
     }
 
@@ -733,7 +741,7 @@ function App() {
     queueVapiAgentTurn({
       endCallAfterSpoken: callIsComplete,
       index: currentAgentTurn.index,
-      message: currentAgentTurn.entry.message,
+      message: displayAgentMessage(currentAgentTurn.entry.message),
     })
   }
 
@@ -937,8 +945,8 @@ function App() {
                 key={`${entry.speaker}-${index}`}
               >
                 <div className={`bubble bubble-${entry.speaker}`}>
-                  <span>{entry.name}</span>
-                  <p>{entry.message}</p>
+                  <span>{entry.speaker === 'agent' ? agentName : entry.name}</span>
+                  <p>{entry.speaker === 'agent' ? displayAgentMessage(entry.message) : entry.message}</p>
                 </div>
               </div>
             ))
@@ -948,7 +956,7 @@ function App() {
 
       <section className="agent-stage" aria-label="Call controls">
         <div className="lead-controls">
-          <label htmlFor="lead">Who is Carla calling?</label>
+          <label htmlFor="lead">Who is {agentName} calling?</label>
           <select
             id="lead"
             value={selectedLeadId}
